@@ -365,17 +365,91 @@ describe("MCP OAuth", () => {
     )
   })
 
-  test("sends the configured URL as the resource when the server publishes no metadata", async () => {
-    const { server, tokenRequests } = authorizationServer({})
-    const url = `${server.url.origin}/mcp`
-    const oauthProvider = await connectProvider(
-      remote(url),
-      memoryCredentials([credential({ access: "expired", refresh: "refresh", url })]),
-    )
+  test.each([
+    { url: "", resource: "" },
+    { url: "/", resource: "/" },
+    { url: "/mcp", resource: "/mcp" },
+    { url: "/mcp?tenant=one#ignored", resource: "/mcp?tenant=one" },
+  ])(
+    "sends the configured URL $url as the resource when the server publishes no metadata",
+    async (input) => {
+      const { server, tokenRequests } = authorizationServer({})
+      const url = `${server.url.origin}${input.url}`
+      const oauthProvider = await connectProvider(
+        remote(url),
+        memoryCredentials([credential({ access: "expired", refresh: "refresh", url })]),
+      )
 
-    await auth(oauthProvider, { serverUrl: url }).finally(() => server.stop(true))
+      await auth(oauthProvider, { serverUrl: url }).finally(() => server.stop(true))
 
-    expect(tokenRequests[0]?.get("resource")).toBe(url)
+      expect(tokenRequests[0]?.get("resource")).toBe(`${server.url.origin}${input.resource}`)
+    },
+  )
+
+  test.each([
+    { endpoint: "/mcp", resource: "" },
+    { endpoint: "", resource: "" },
+    { endpoint: "/", resource: "" },
+    { endpoint: "", resource: "/" },
+    { endpoint: "/mcp", resource: "/mcp" },
+    { endpoint: "/mcp/", resource: "/mcp/" },
+  ])("preserves resource $resource for endpoint $endpoint throughout OAuth", async (input) => {
+    const tokenRequests: URLSearchParams[] = []
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        const url = new URL(request.url)
+        if (url.pathname === "/custom/metadata" || url.pathname.startsWith("/.well-known/oauth-protected-resource"))
+          return Response.json({ resource: `${url.origin}${input.resource}`, authorization_servers: [url.origin] })
+        if (url.pathname === "/.well-known/oauth-authorization-server")
+          return Response.json({
+            issuer: url.origin,
+            authorization_endpoint: `${url.origin}/authorize`,
+            token_endpoint: `${url.origin}/token`,
+            response_types_supported: ["code"],
+          })
+        if (request.method === "POST" && url.pathname === "/token") {
+          tokenRequests.push(new URLSearchParams(await request.text()))
+          return Response.json({ access_token: "access", token_type: "Bearer", refresh_token: "refresh" })
+        }
+        return new Response(null, {
+          status: 401,
+          headers: { "WWW-Authenticate": `Bearer resource_metadata="${url.origin}/custom/metadata"` },
+        })
+      },
+    })
+    const url = `${server.url.origin}${input.endpoint}`
+    const resource = `${server.url.origin}${input.resource}`
+
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const result = yield* start(url, { client_id: "client" })
+          expect(result.url.searchParams.get("resource")).toBe(resource)
+          const redirectValue = result.url.searchParams.get("redirect_uri")
+          const state = result.url.searchParams.get("state")
+          if (!redirectValue || !state) throw new Error("Missing OAuth redirect parameters")
+          const redirect = new URL(redirectValue)
+          redirect.searchParams.set("code", "accepted")
+          redirect.searchParams.set("state", state)
+          expect((yield* Effect.promise(() => fetch(redirect))).status).toBe(200)
+          const value = yield* result.authorization.callback
+          const store = memoryCredentials([
+            new Credential.Info({
+              id: Credential.ID.make("cred_test"),
+              integrationID,
+              label: "test",
+              value: { ...value, expires: 1 },
+            }),
+          ])
+          const oauthProvider = yield* Effect.promise(() => connectProvider(remote(url), store))
+          expect(yield* Effect.promise(() => auth(oauthProvider, { serverUrl: url }))).toBe("AUTHORIZED")
+        }),
+      ),
+    ).finally(() => server.stop(true))
+
+    expect(tokenRequests.map((request) => request.get("grant_type"))).toEqual(["authorization_code", "refresh_token"])
+    expect(tokenRequests.map((request) => request.get("resource"))).toEqual([resource, resource])
   })
 
   test("discovers resource metadata without the query the transport dialed", async () => {
@@ -398,7 +472,7 @@ describe("MCP OAuth", () => {
     expect(probes.some((probe) => probe.includes("codemode"))).toBe(false)
   })
 
-  test("keeps the configured URL as the resource when metadata echoes the dialed query", async () => {
+  test.each(["", "/mcp"])("keeps resource %s when metadata echoes the dialed query", async (suffix) => {
     const tokenRequests: URLSearchParams[] = []
     const server = Bun.serve({
       port: 0,
@@ -411,8 +485,8 @@ describe("MCP OAuth", () => {
             token_endpoint: `${url.origin}/token`,
             response_types_supported: ["code"],
           })
-        if (url.pathname === "/.well-known/oauth-protected-resource/mcp")
-          return Response.json({ resource: `${url.origin}/mcp${url.search}`, authorization_servers: [url.origin] })
+        if (url.pathname === `/.well-known/oauth-protected-resource${suffix}`)
+          return Response.json({ resource: `${url.origin}${suffix}${url.search}`, authorization_servers: [url.origin] })
         if (request.method === "POST" && url.pathname === "/token") {
           tokenRequests.push(new URLSearchParams(await request.text()))
           return Response.json({ access_token: "next", token_type: "Bearer" })
@@ -420,7 +494,7 @@ describe("MCP OAuth", () => {
         return new Response(null, { status: 404 })
       },
     })
-    const url = `${server.url.origin}/mcp`
+    const url = `${server.url.origin}${suffix}`
     const oauthProvider = await connectProvider(
       remote(url),
       memoryCredentials([credential({ access: "expired", refresh: "refresh", url })]),
@@ -429,7 +503,7 @@ describe("MCP OAuth", () => {
     // The transport dials with ?codemode=false and follows the 401 challenge to metadata that echoes it.
     await auth(oauthProvider, {
       serverUrl: `${url}?codemode=false`,
-      resourceMetadataUrl: new URL(`${server.url.origin}/.well-known/oauth-protected-resource/mcp?codemode=false`),
+      resourceMetadataUrl: new URL(`${server.url.origin}/.well-known/oauth-protected-resource${suffix}?codemode=false`),
     }).finally(() => server.stop(true))
 
     expect(tokenRequests[0]?.get("grant_type")).toBe("refresh_token")
@@ -464,10 +538,10 @@ describe("MCP OAuth", () => {
     expect(url.pathname).toBe("/as/authorize")
   })
 
-  test("uses configured authorization server metadata when the resource publishes none", async () => {
+  test.each(["", "/mcp"])("uses configured authorization server metadata for resource %s", async (suffix) => {
     const { server: issuer } = authorizationServer({})
     const resource = Bun.serve({ port: 0, fetch: () => new Response(null, { status: 404 }) })
-    const url = `${resource.url.origin}/mcp`
+    const url = `${resource.url.origin}${suffix}`
     const oauth = {
       client_id: "client",
       auth_server_metadata_url: `${issuer.url.origin}/.well-known/oauth-authorization-server`,
