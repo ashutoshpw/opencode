@@ -1,10 +1,20 @@
 import { describe, expect } from "bun:test"
 import { Effect, Schema } from "effect"
 import { HttpClientRequest } from "effect/http"
-import { LLM, LLMEvent, LLMRequest, Media, Message, ToolCallPart, ToolChoice, ToolDefinition } from "../../src/effect.js"
+import {
+  LLM,
+  LLMEvent,
+  LLMRequest,
+  Media,
+  Message,
+  ToolCallPart,
+  ToolChoice,
+  ToolDefinition,
+} from "../../src/effect.js"
 import { Auth, LLMClient } from "../../src/route.js"
 import { compileRequest } from "../../src/route/client.js"
-import * as OpenAICompatibleChat from "../../src/protocols/openai-compatible-chat.js"
+import { OpenAIChat } from "../../src/protocols/openai-chat.js"
+import { OpenAICompatibleChat } from "../../src/protocols/openai-compatible-chat.js"
 import { it } from "../lib/effect.js"
 import { dynamicResponse, fixedResponse } from "../lib/http.js"
 import { sseEvents } from "../lib/sse.js"
@@ -41,6 +51,143 @@ const usageChunk = (usage: object) => ({
 })
 
 describe("OpenAI-compatible Chat route", () => {
+  for (const text of ["497e863", "-497e863", "1E+309", "9".repeat(400), "497e863 commit subject", " \t497e863\n"]) {
+    it.effect(`quotes overflowing numeric text on replay: ${text.slice(0, 30)}`, () =>
+      Effect.gen(function* () {
+        const messages = [
+          Message.user(text),
+          Message.assistant(text),
+          Message.assistant(
+            ToolCallPart.make({ id: "call_git", name: "shell", input: { command: "git rev-parse --short HEAD" } }),
+          ),
+          Message.tool({ id: "call_git", name: "shell", result: { type: "text", value: text } }),
+          Message.assistant(ToolCallPart.make({ id: "call_content", name: "shell", input: {} })),
+          Message.tool({
+            id: "call_content",
+            name: "shell",
+            result: { type: "content", value: [{ type: "text", text }] },
+          }),
+        ]
+        const prepared = yield* compileRequest(LLM.request({ model, messages }))
+
+        expect(prepared.body.messages[0]).toMatchObject({ role: "user", content: text })
+        expect(prepared.body.messages[1]).toMatchObject({ role: "assistant", content: JSON.stringify(text) })
+        expect(prepared.body.messages[2]).toMatchObject({
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "call_git", function: { arguments: '{"command":"git rev-parse --short HEAD"}' } }],
+        })
+        expect(prepared.body.messages[3]).toMatchObject({ role: "tool", content: JSON.stringify(text) })
+        expect(prepared.body.messages[5]).toMatchObject({ role: "tool", content: JSON.stringify(text) })
+        expect(messages[1]?.content).toMatchObject([{ type: "text", text }])
+        expect(messages[3]?.content).toMatchObject([{ type: "tool-result", result: { type: "text", value: text } }])
+      }),
+    )
+  }
+
+  it.effect("preserves ordinary text, finite numbers, and quoted commit hashes", () =>
+    Effect.gen(function* () {
+      for (const text of ["48478a8", "497e3", "1e308", "1e-863", '"497e863"', "commit 497e863", "null", "{}", "[]"]) {
+        const prepared = yield* compileRequest(
+          LLM.request({
+            model,
+            messages: [
+              Message.assistant(text),
+              Message.assistant(ToolCallPart.make({ id: "call_git", name: "shell", input: {} })),
+              Message.tool({ id: "call_git", name: "shell", result: { type: "text", value: text } }),
+            ],
+          }),
+        )
+        expect(prepared.body.messages[0]).toMatchObject({ role: "assistant", content: text })
+        expect(prepared.body.messages[2]).toMatchObject({ role: "tool", content: text })
+      }
+    }),
+  )
+
+  it.effect("preserves cache metadata when quoting text parts", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLM.request({
+          model: OpenAICompatibleChat.route
+            .with({ provider: "custom", endpoint: { baseURL: "https://api.custom.test/v1" } })
+            .model({ id: "model", compatibility: { cacheFormat: "anthropic" } }),
+          system: "497e863",
+          messages: [
+            Message.assistant([{ type: "text", text: "497e863", cache: { type: "ephemeral" } }]),
+            Message.assistant(ToolCallPart.make({ id: "call_git", name: "shell", input: { hash: "497e863" } })),
+            Message.tool({
+              id: "call_git",
+              name: "shell",
+              result: { type: "text", value: "497e863" },
+              cache: { type: "ephemeral" },
+            }),
+          ],
+        }),
+      )
+      expect(prepared.body.messages).toMatchObject([
+        { role: "system", content: [{ type: "text", text: "497e863", cache_control: { type: "ephemeral" } }] },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: '"497e863"', cache_control: { type: "ephemeral" } }],
+        },
+        { role: "assistant", content: null, tool_calls: [{ function: { arguments: '{"hash":"497e863"}' } }] },
+        {
+          role: "tool",
+          content: [{ type: "text", text: '"497e863"', cache_control: { type: "ephemeral" } }],
+        },
+      ])
+    }),
+  )
+
+  it.effect("sends reusable history with quoted git output through HTTP", () =>
+    Effect.gen(function* () {
+      const messages = [
+        Message.assistant(ToolCallPart.make({ id: "call_git", name: "shell", input: {} })),
+        Message.tool({ id: "call_git", name: "shell", result: { type: "text", value: "497e863\n" } }),
+        Message.user("Continue"),
+      ]
+      const seen: string[] = []
+      const server = dynamicResponse((input) =>
+        Effect.sync(() => {
+          seen.push(input.text)
+          expect(JSON.parse(input.text).messages[1]).toEqual({
+            role: "tool",
+            tool_call_id: "call_git",
+            content: '"497e863\\n"',
+          })
+          return input.respond(sseEvents(deltaChunk({ content: "Continued" }), deltaChunk({}, "stop")), {
+            headers: { "content-type": "text/event-stream" },
+          })
+        }),
+      )
+      for (const _ of [0, 1]) {
+        const response = yield* LLMClient.generate(LLM.request({ model, messages })).pipe(Effect.provide(server))
+        expect(response.text).toBe("Continued")
+      }
+      expect(seen).toHaveLength(2)
+      expect(messages[1]?.content).toMatchObject([
+        { type: "tool-result", result: { type: "text", value: "497e863\n" } },
+      ])
+    }),
+  )
+
+  it.effect("leaves native OpenAI text untouched", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(
+        LLM.request({
+          model: OpenAIChat.route.with({ endpoint: { baseURL: "https://api.openai.test/v1" } }).model({ id: "gpt-4o" }),
+          messages: [
+            Message.assistant("497e863"),
+            Message.assistant(ToolCallPart.make({ id: "call_git", name: "shell", input: {} })),
+            Message.tool({ id: "call_git", name: "shell", result: { type: "text", value: "497e863" } }),
+          ],
+        }),
+      )
+      expect(prepared.body.messages[0]).toMatchObject({ role: "assistant", content: "497e863" })
+      expect(prepared.body.messages[2]).toMatchObject({ role: "tool", content: "497e863" })
+    }),
+  )
+
   it.effect("serializes user and tool video for unknown compatible providers", () =>
     Effect.gen(function* () {
       const inline = "data:video/mp4;base64,AAEC"
@@ -156,7 +303,10 @@ describe("OpenAI-compatible Chat route", () => {
       const declared = yield* prepare("anthropic")
       expect(declared.body).toMatchObject({
         messages: [
-          { role: "system", content: [{ type: "text", text: "You are concise.", cache_control: { type: "ephemeral" } }] },
+          {
+            role: "system",
+            content: [{ type: "text", text: "You are concise.", cache_control: { type: "ephemeral" } }],
+          },
           { role: "user", content: [{ type: "text", text: "Say hello.", cache_control: { type: "ephemeral" } }] },
         ],
         tools: [{ function: { name: "lookup" }, cache_control: { type: "ephemeral" } }],
@@ -166,7 +316,10 @@ describe("OpenAI-compatible Chat route", () => {
       const alibaba = yield* prepare("alibaba")
       expect(alibaba.body).toMatchObject({
         messages: [
-          { role: "system", content: [{ type: "text", text: "You are concise.", cache_control: { type: "ephemeral" } }] },
+          {
+            role: "system",
+            content: [{ type: "text", text: "You are concise.", cache_control: { type: "ephemeral" } }],
+          },
           { role: "user", content: [{ type: "text", text: "Say hello.", cache_control: { type: "ephemeral" } }] },
         ],
       })
