@@ -7,7 +7,6 @@ import {
   discoverOAuthServerInfo,
   extractWWWAuthenticateParams,
   parseErrorResponse,
-  resourceUrlFromServerUrl,
   UnauthorizedError,
   type FetchLike,
   type OAuthClientProvider,
@@ -119,7 +118,7 @@ export const configuredDiscovery = async (input: {
   return {
     authorizationServerUrl: metadata.issuer,
     authorizationServerMetadata: metadata,
-    resourceMetadata: { resource: resourceUrlFromServerUrl(input.config.url).toString() },
+    resourceMetadata: { resource: input.config.url.split("#", 1)[0] },
   }
 }
 
@@ -155,6 +154,7 @@ export const provider = (options: Options): OAuthClientProvider => {
   const refuse = (what: string) => new UnauthorizedError(`MCP server "${options.config.url}" requires ${what}`)
   const identity = new URL(options.config.url)
   identity.hash = ""
+  const configuredResource = options.config.url.split("#", 1)[0]
   let discovery: OAuthDiscoveryState | undefined = options.discovery
   return {
     redirectUrl,
@@ -168,15 +168,21 @@ export const provider = (options: Options): OAuthClientProvider => {
     // The SDK sends no RFC 8707 resource when the server publishes no resource metadata; some
     // authorization servers require one, so fall back to the configured URL.
     validateResourceURL: async (_serverUrl, resource) => {
-      if (!resource) return identity
+      if (!resource) return configuredResource
       if (!checkResourceAllowed({ requestedResource: identity, configuredResource: resource }))
         throw new Error(`Protected resource ${resource} does not cover ${identity}`)
       const canonical = new URL(resource)
       // The transport dials the configured URL with extra query parameters and some servers echo
       // that back as the resource. Query is transport detail, not identity: the token stays bound
       // to the configured URL so a later refresh names the same resource the login did.
-      if (canonical.origin === identity.origin && canonical.pathname === identity.pathname) return identity
-      return canonical
+      if (
+        canonical.origin === identity.origin &&
+        canonical.pathname === identity.pathname &&
+        canonical.search !== identity.search
+      )
+        return configuredResource
+      // URL serialization adds a slash to bare origins, but OAuth resource identifiers match exactly.
+      return resource
     },
     ...(options.clientMetadataUrl ? { clientMetadataUrl: options.clientMetadataUrl } : {}),
     ...(redirect ? { state: () => redirect.state } : {}),
